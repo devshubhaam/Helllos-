@@ -3,6 +3,7 @@ Telegram Course Bot + FamGateway auto-verification + Admin panel
 Env vars: BOT_TOKEN, FAM_API_KEY, ADMIN_ID, (optional) DATA_DIR
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -10,7 +11,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
+                      InputMediaVideo, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -31,16 +33,25 @@ HEADERS = {"X-Api-Key": FAM_API_KEY, "Content-Type": "application/json"}
 
 
 # ---------- storage (JSON file) ----------
+def normalize(d):
+    d.setdefault("demos", [])
+    if d.get("demo"):  # migrate old single-video format
+        d["demos"].append(d["demo"])
+    d.pop("demo", None)
+    for x in d["demos"]:
+        x.setdefault("uid", hashlib.md5(x["file_id"].encode()).hexdigest()[:12])
+    d.setdefault("plans", {})
+    d.setdefault("next_id", 1)
+    return d
+
+
 def load_db():
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
             d = json.load(f)
     except Exception:
         d = {}
-    d.setdefault("demo", None)
-    d.setdefault("plans", {})
-    d.setdefault("next_id", 1)
-    return d
+    return normalize(d)
 
 
 def save_db():
@@ -87,18 +98,26 @@ def plans_keyboard():
 
 
 async def send_home(bot, chat_id):
-    """Demo video first, with the plan buttons directly underneath."""
+    """Demo video(s) first, with the plan buttons underneath."""
     kb = plans_keyboard()
-    demo = DB["demo"]
-    if demo:
-        cap = (demo["caption"][:800] + "\n\n") if demo.get("caption") else ""
-        cap += HOME_TEXT if kb else "No plans are available right now. Please check back soon."
-        await bot.send_video(chat_id, demo["file_id"], caption=cap,
+    demos = DB["demos"][:10]
+    body = HOME_TEXT if kb else "No plans are available right now. Please check back soon."
+    if len(demos) == 1:
+        d = demos[0]
+        cap = (d["caption"][:800] + "\n\n") if d.get("caption") else ""
+        await bot.send_video(chat_id, d["file_id"], caption=cap + body,
                              reply_markup=kb, supports_streaming=True)
+    elif len(demos) > 1:
+        media = [InputMediaVideo(d["file_id"],
+                                 caption=(d["caption"][:900] if i == 0 and d.get("caption") else None),
+                                 supports_streaming=True)
+                 for i, d in enumerate(demos)]
+        await bot.send_media_group(chat_id, media)
+        await bot.send_message(chat_id, body, reply_markup=kb)
     elif kb:
-        await bot.send_message(chat_id, f"👋 Welcome!\n\n{HOME_TEXT}", reply_markup=kb)
+        await bot.send_message(chat_id, f"👋 Welcome!\n\n{body}", reply_markup=kb)
     else:
-        await bot.send_message(chat_id, "No plans are available right now. Please check back soon.")
+        await bot.send_message(chat_id, body)
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -117,10 +136,20 @@ async def get_link(ctx, plan):
     return link
 
 
+async def del_qr(bot, uid, a):
+    mid = a.get("qr_msg")
+    if mid:
+        try:
+            await bot.delete_message(uid, mid)
+        except Exception:
+            pass
+
+
 async def deliver(ctx, user_id, order_id, plan, utr=""):
     if order_id in delivered:
         return
     delivered.add(order_id)
+    a = active.get(user_id)
     link = await get_link(ctx, plan)
     if not link:
         delivered.discard(order_id)
@@ -132,6 +161,8 @@ async def deliver(ctx, user_id, order_id, plan, utr=""):
                       f"Order: {order_id}\nUTR: {utr}\nPlan: {plan['name']}\n"
                       "Make sure the bot is an admin in the group with 'Invite users' permission.")
         return
+    if a:
+        await del_qr(ctx.bot, user_id, a)  # remove the QR/payment message first
     await ctx.bot.send_message(
         user_id, f"✅ Payment confirmed!\n\n🎓 Your access link:\n{link}\n\n"
                  "This link works only once, so please join right away.")
@@ -153,9 +184,11 @@ async def poll_order(ctx, user_id, order_id, plan):
                 return
             if status in ("expired", "not_found"):
                 break
+        a = active.pop(user_id, None)
+        if a:
+            await del_qr(ctx.bot, user_id, a)
         await ctx.bot.send_message(
             user_id, "⌛ Your order has expired. Send /start to choose a plan again.")
-        active.pop(user_id, None)
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -175,6 +208,7 @@ async def on_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     old = active.pop(uid, None)
     if old:
         old["task"].cancel()
+        await del_qr(ctx.bot, uid, old)
 
     res = await fam_create_order(plan["price"], q.from_user.full_name)
     if res.get("status") != "success":
@@ -197,10 +231,11 @@ async def on_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("I have paid ✅", callback_data="paid")],
         [InlineKeyboardButton("⬅ Back", callback_data="back")],
     ])
-    await ctx.bot.send_photo(uid, await fetch_bytes(d["qr_url"]),
-                             caption=caption, reply_markup=kb)
+    msg = await ctx.bot.send_photo(uid, await fetch_bytes(d["qr_url"]),
+                                   caption=caption, reply_markup=kb)
     task = asyncio.create_task(poll_order(ctx, uid, d["order_id"], plan))
-    active[uid] = {"order_id": d["order_id"], "plan": plan, "task": task}
+    active[uid] = {"order_id": d["order_id"], "plan": plan, "task": task,
+                   "qr_msg": msg.message_id}
 
 
 async def on_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -227,6 +262,10 @@ async def on_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     old = active.pop(q.from_user.id, None)
     if old:
         old["task"].cancel()
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
     await send_home(ctx.bot, q.message.chat_id)
 
 
@@ -235,8 +274,9 @@ def admin_panel_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add plan", callback_data="adm:add")],
         [InlineKeyboardButton("📋 View / delete plans", callback_data="adm:list")],
-        [InlineKeyboardButton("🎬 Set demo video", callback_data="adm:demo")],
-        [InlineKeyboardButton("🗑 Remove demo video", callback_data="adm:rmdemo")],
+        [InlineKeyboardButton("🎬 Add demo video(s)", callback_data="adm:demo")],
+        [InlineKeyboardButton("📋 View / delete demo videos", callback_data="adm:demos")],
+        [InlineKeyboardButton("🗑 Remove all demo videos", callback_data="adm:rmdemo")],
         [InlineKeyboardButton("💾 Backup data", callback_data="adm:backup")],
     ])
 
@@ -263,7 +303,11 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kind, _, val = q.data.partition(":")
     chat = q.message.chat_id
 
-    if kind == "del":
+    if kind == "dv":
+        DB["demos"] = [x for x in DB["demos"] if x["uid"] != val]
+        save_db()
+        await q.edit_message_text("🗑 Demo video deleted. Open /admin to continue.")
+    elif kind == "del":
         DB["plans"].pop(val, None)
         save_db()
         await q.edit_message_text("🗑 Plan deleted. Open /admin to continue.")
@@ -282,13 +326,22 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                    reply_markup=InlineKeyboardMarkup(rows))
     elif val == "demo":
         await ctx.bot.send_message(
-            chat, "🎬 Send me a video now. It will be saved as the demo video and shown to every "
-                  "user at the top when they press /start.\n\nTip: add a caption to the video and "
-                  "it will be shown with it.")
+            chat, "🎬 Send me one or more videos now (max 10). Each video is added to the demo list "
+                  "and shown to every user at the top when they press /start.\n\n"
+                  "Tip: the caption of the FIRST video is shown with the demo.")
+    elif val == "demos":
+        if not DB["demos"]:
+            await ctx.bot.send_message(chat, "No demo videos yet. Use 🎬 Add demo video(s).")
+            return
+        rows = [[InlineKeyboardButton(f"🗑 Delete video {i + 1}", callback_data=f"dv:{x['uid']}")]
+                for i, x in enumerate(DB["demos"])]
+        await ctx.bot.send_message(
+            chat, f"You have {len(DB['demos'])} demo video(s), shown in this order. Tap to delete:",
+            reply_markup=InlineKeyboardMarkup(rows))
     elif val == "rmdemo":
-        DB["demo"] = None
+        DB["demos"] = []
         save_db()
-        await ctx.bot.send_message(chat, "🗑 Demo video removed.")
+        await ctx.bot.send_message(chat, "🗑 All demo videos removed.")
     elif val == "backup":
         save_db()
         with open(DATA_FILE, "rb") as f:
@@ -340,11 +393,18 @@ async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def admin_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     v = update.message.video
-    DB["demo"] = {"file_id": v.file_id, "caption": update.message.caption or ""}
+    if any(x["uid"] == v.file_unique_id for x in DB["demos"]):
+        await update.message.reply_text("This video is already in the demo list.")
+        return
+    if len(DB["demos"]) >= 10:
+        await update.message.reply_text("Maximum 10 demo videos reached. Delete one from /admin first.")
+        return
+    DB["demos"].append({"uid": v.file_unique_id, "file_id": v.file_id,
+                        "caption": update.message.caption or ""})
     save_db()
     await update.message.reply_text(
-        "✅ Demo video saved. It will now appear at the top for every user on /start.\n"
-        "Send /start to preview it.")
+        f"✅ Demo video added ({len(DB['demos'])}/10). Send more videos to add them, "
+        "or /start to preview.")
 
 
 async def admin_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -359,13 +419,10 @@ async def admin_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ That file is not a valid backup.")
         return
     DB.clear()
-    DB.update(d)
-    DB.setdefault("demo", None)
-    DB.setdefault("plans", {})
-    DB.setdefault("next_id", 1)
+    DB.update(normalize(d))
     save_db()
     await update.message.reply_text(
-        f"✅ Backup restored: {len(DB['plans'])} plan(s), demo video: {'yes' if DB['demo'] else 'no'}.")
+        f"✅ Backup restored: {len(DB['plans'])} plan(s), {len(DB['demos'])} demo video(s).")
 
 
 # ---------- health server for Render ----------
@@ -394,7 +451,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_plan, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_paid, pattern=r"^paid$"))
     app.add_handler(CallbackQueryHandler(on_back, pattern=r"^back$"))
-    app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^(adm|del):"))
+    app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^(adm|del|dv):"))
     app.add_handler(MessageHandler(filters.VIDEO & adm, admin_video))
     app.add_handler(MessageHandler(filters.Document.ALL & adm, admin_doc))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & adm, admin_text))

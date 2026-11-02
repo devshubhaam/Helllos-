@@ -1,9 +1,9 @@
 """
-Telegram Course Bot + FamGateway (auto payment verification)
-Install:  pip install "python-telegram-bot==21.6" httpx
-Run:      python bot_famgateway.py
+Telegram Course Bot + FamGateway auto-verification + Admin panel
+Env vars: BOT_TOKEN, FAM_API_KEY, ADMIN_ID, (optional) DATA_DIR
 """
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -12,83 +12,133 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes)
+                          ContextTypes, MessageHandler, filters)
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 FAM_API_KEY = os.environ["FAM_API_KEY"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 FAM_BASE = "https://famgateway.in"
-
-# key: (button name, price INR, group_chat_id or None, fallback invite link)
-# group_chat_id (e.g. -1001234567890) dene ke liye bot ko us group me admin
-# banao (Invite Users permission). Tab har buyer ko single-use link milega.
-PLANS = {
-    "g1": ("Group 1 - Candlestick Basics", 49, None, "https://t.me/+XXXXXXXX1"),
-    "g2": ("Group 2 - Price Action", 99, None, "https://t.me/+XXXXXXXX2"),
-    "g3": ("Group 3 - Option Trading", 149, None, "https://t.me/+XXXXXXXX3"),
-    "g4": ("All Groups - Lifetime", 249, None, "https://t.me/+XXXXXXXX4"),
-}
-POLL_EVERY = 4        # seconds (docs: 3-5s)
-ORDER_TTL = 300       # gateway order expiry = 5 min
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
+POLL_EVERY = 4      # seconds
+ORDER_TTL = 300     # gateway order expiry (5 min)
+HOME_TEXT = "📈 𝗦𝗘𝗟𝗘𝗖𝗧 𝗬𝗢𝗨𝗥 𝗧𝗥𝗔𝗗𝗜𝗡𝗚 𝗚𝗥𝗢𝗨𝗣 👇"
 # ============================================
 
 logging.basicConfig(level=logging.INFO)
 HEADERS = {"X-Api-Key": FAM_API_KEY, "Content-Type": "application/json"}
 
-active = {}       # user_id -> {"order_id", "plan", "task"}
-delivered = set() # order_ids already fulfilled (double-delivery guard)
+
+# ---------- storage (JSON file) ----------
+def load_db():
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    d.setdefault("demo", None)
+    d.setdefault("plans", {})
+    d.setdefault("next_id", 1)
+    return d
 
 
-async def fam_create_order(amount: int, name: str):
+def save_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False, indent=2)
+
+
+DB = load_db()
+active = {}        # user_id -> {"order_id", "plan", "task"}
+delivered = set()  # order_ids already fulfilled
+
+
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
+
+
+# ---------- FamGateway ----------
+async def fam_create_order(amount, name):
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{FAM_BASE}/api/create-order", headers=HEADERS,
                          json={"amount": float(amount), "customer_name": name})
         return r.json()
 
 
-async def fam_verify(order_id: str):
+async def fam_verify(order_id):
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{FAM_BASE}/api/verify-order.php",
                         headers=HEADERS, params={"order_id": order_id})
         return r.json()
 
 
-async def fetch_qr(url: str) -> bytes:
+async def fetch_bytes(url):
     async with httpx.AsyncClient(timeout=20) as c:
         return (await c.get(url)).content
 
 
+# ---------- user side ----------
 def plans_keyboard():
-    rows = [[InlineKeyboardButton(f"{n} - ₹{p}", callback_data=f"plan:{k}")]
-            for k, (n, p, _, _) in PLANS.items()]
-    return InlineKeyboardMarkup(rows)
+    rows = [[InlineKeyboardButton(f"{p['name']} - ₹{p['price']}",
+                                  callback_data=f"plan:{pid}")]
+            for pid, p in DB["plans"].items()]
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def get_link(ctx, plan_key: str) -> str:
-    _, _, chat_id, fallback = PLANS[plan_key]
-    if chat_id:
+async def send_home(bot, chat_id):
+    """Demo video first, with the plan buttons directly underneath."""
+    kb = plans_keyboard()
+    demo = DB["demo"]
+    if demo:
+        cap = (demo["caption"][:800] + "\n\n") if demo.get("caption") else ""
+        cap += HOME_TEXT if kb else "No plans are available right now. Please check back soon."
+        await bot.send_video(chat_id, demo["file_id"], caption=cap,
+                             reply_markup=kb, supports_streaming=True)
+    elif kb:
+        await bot.send_message(chat_id, f"👋 Welcome!\n\n{HOME_TEXT}", reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, "No plans are available right now. Please check back soon.")
+
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await send_home(ctx.bot, update.effective_chat.id)
+
+
+async def get_link(ctx, plan):
+    link = plan["link"]
+    if link.lstrip("-").isdigit():  # chat id -> single-use invite
         try:
-            inv = await ctx.bot.create_chat_invite_link(chat_id, member_limit=1)
+            inv = await ctx.bot.create_chat_invite_link(int(link), member_limit=1)
             return inv.invite_link
         except Exception as e:
             logging.warning("invite link failed: %s", e)
-    return fallback
+            return None
+    return link
 
 
-async def deliver(ctx, user_id: int, order_id: str, plan_key: str, utr: str = ""):
+async def deliver(ctx, user_id, order_id, plan, utr=""):
     if order_id in delivered:
         return
     delivered.add(order_id)
-    link = await get_link(ctx, plan_key)
+    link = await get_link(ctx, plan)
+    if not link:
+        delivered.discard(order_id)
+        await ctx.bot.send_message(
+            user_id, "✅ Payment received, but we could not generate your link right now. "
+                     "The admin has been notified and will send it to you shortly.")
+        await ctx.bot.send_message(
+            ADMIN_ID, f"⚠️ Link generation failed.\nUser ID: {user_id}\n"
+                      f"Order: {order_id}\nUTR: {utr}\nPlan: {plan['name']}\n"
+                      "Make sure the bot is an admin in the group with 'Invite users' permission.")
+        return
     await ctx.bot.send_message(
-        user_id,
-        f"✅ Payment confirmed!\nUTR: {utr}\n\n🎓 Your access link:\n{link}\n\n"
-        "Link sirf ek baar kaam karega, jaldi join karo.")
+        user_id, f"✅ Payment confirmed!\n\n🎓 Your access link:\n{link}\n\n"
+                 "This link works only once, so please join right away.")
     active.pop(user_id, None)
 
 
-async def poll_order(ctx, user_id: int, order_id: str, plan_key: str, price: int):
-    """Background loop: har 4s verify-order check karta hai."""
+async def poll_order(ctx, user_id, order_id, plan):
     waited = 0
     try:
         while waited <= ORDER_TTL + 20:
@@ -98,13 +148,13 @@ async def poll_order(ctx, user_id: int, order_id: str, plan_key: str, price: int
             status = res.get("status")
             if status == "success":
                 data = res.get("data", {})
-                if float(data.get("amount", 0)) >= price:
-                    await deliver(ctx, user_id, order_id, plan_key, data.get("utr", ""))
+                if float(data.get("amount", 0)) >= float(plan["price"]):
+                    await deliver(ctx, user_id, order_id, plan, data.get("utr", ""))
                 return
             if status in ("expired", "not_found"):
                 break
         await ctx.bot.send_message(
-            user_id, "⌛ Order expire ho gaya. Dobara /start karke plan chuno.")
+            user_id, "⌛ Your order has expired. Send /start to choose a plan again.")
         active.pop(user_id, None)
     except asyncio.CancelledError:
         pass
@@ -112,51 +162,45 @@ async def poll_order(ctx, user_id: int, order_id: str, plan_key: str, price: int
         logging.exception("poll error")
 
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome!\n\n📈 𝗦𝗘𝗟𝗘𝗖𝗧 𝗬𝗢𝗨𝗥 𝗧𝗥𝗔𝗗𝗜𝗡𝗚 𝗚𝗥𝗢𝗨𝗣 👇",
-        reply_markup=plans_keyboard())
-
-
 async def on_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     uid = q.from_user.id
-    key = q.data.split(":")[1]
-    name, price, _, _ = PLANS[key]
+    pid = q.data.split(":")[1]
+    plan = DB["plans"].get(pid)
+    if not plan:
+        await q.answer("This plan is no longer available.", show_alert=True)
+        return
+    await q.answer()
 
-    # purana pending order ho to uska polling band karo
     old = active.pop(uid, None)
     if old:
         old["task"].cancel()
 
-    res = await fam_create_order(price, q.from_user.full_name)
+    res = await fam_create_order(plan["price"], q.from_user.full_name)
     if res.get("status") != "success":
-        await ctx.bot.send_message(uid, "❌ Order nahi ban paya, thodi der baad try karo.")
         logging.error("create-order failed: %s", res)
+        await ctx.bot.send_message(uid, "❌ We could not create your order. Please try again in a moment.")
         return
     d = res["data"]
-    pay_amt = d["payable_amount"]  # kabhi 49.01 bhi ho sakta hai, yahi dikhana hai
 
     caption = (
-        f"📌 {name}\n\n"
-        f"💰 Exact amount pay karo: ₹{pay_amt}\n"
+        f"📌 {plan['name']}\n\n"
+        f"💰 Pay exactly: ₹{d['payable_amount']}\n"
         f"💳 UPI ID: {d['upi_id']}\n"
-        f"📲 QR scan karke pay karo\n"
-        f"⏱ 5 minute me expire hoga\n"
-        f"⚡ Payment ke baad access apne aap mil jayega\n\n"
-        f"⚠️ Amount bilkul wahi bhejna jo upar likha hai."
+        f"📲 Scan the QR code with any UPI app and pay.\n"
+        f"⏱ This order expires in 5 minutes.\n"
+        f"⚡ Your access link is sent automatically after payment.\n\n"
+        f"⚠️ Please send the exact amount shown above."
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Open UPI App", url=d["checkout_url"])],
+        [InlineKeyboardButton("📱 Pay with UPI app", url=d["checkout_url"])],
         [InlineKeyboardButton("I have paid ✅", callback_data="paid")],
         [InlineKeyboardButton("⬅ Back", callback_data="back")],
     ])
-    qr_bytes = await fetch_qr(d["qr_url"])
-    await ctx.bot.send_photo(uid, qr_bytes, caption=caption, reply_markup=kb)
-
-    task = asyncio.create_task(poll_order(ctx, uid, d["order_id"], key, price))
-    active[uid] = {"order_id": d["order_id"], "plan": key, "price": price, "task": task}
+    await ctx.bot.send_photo(uid, await fetch_bytes(d["qr_url"]),
+                             caption=caption, reply_markup=kb)
+    task = asyncio.create_task(poll_order(ctx, uid, d["order_id"], plan))
+    active[uid] = {"order_id": d["order_id"], "plan": plan, "task": task}
 
 
 async def on_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -164,17 +208,16 @@ async def on_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     a = active.get(uid)
     if not a:
-        await q.answer("Koi active order nahi. /start karo.", show_alert=True)
+        await q.answer("No active order. Send /start to begin.", show_alert=True)
         return
     res = await fam_verify(a["order_id"])
-    if res.get("status") == "success":
+    data = res.get("data", {})
+    if res.get("status") == "success" and float(data.get("amount", 0)) >= float(a["plan"]["price"]):
         await q.answer()
-        data = res.get("data", {})
-        if float(data.get("amount", 0)) >= a["price"]:
-            a["task"].cancel()
-            await deliver(ctx, uid, a["order_id"], a["plan"], data.get("utr", ""))
+        a["task"].cancel()
+        await deliver(ctx, uid, a["order_id"], a["plan"], data.get("utr", ""))
     else:
-        await q.answer("Payment abhi nahi mila. Pay karke 10 sec baad dobara dabao.",
+        await q.answer("Payment not received yet. Please wait a few seconds and try again.",
                        show_alert=True)
 
 
@@ -184,11 +227,148 @@ async def on_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     old = active.pop(q.from_user.id, None)
     if old:
         old["task"].cancel()
-    await ctx.bot.send_message(q.message.chat_id,
-                               "📈 𝗦𝗘𝗟𝗘𝗖𝗧 𝗬𝗢𝗨𝗥 𝗧𝗥𝗔𝗗𝗜𝗡𝗚 𝗚𝗥𝗢𝗨𝗣 👇",
-                               reply_markup=plans_keyboard())
+    await send_home(ctx.bot, q.message.chat_id)
 
 
+# ---------- admin side ----------
+def admin_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add plan", callback_data="adm:add")],
+        [InlineKeyboardButton("📋 View / delete plans", callback_data="adm:list")],
+        [InlineKeyboardButton("🎬 Set demo video", callback_data="adm:demo")],
+        [InlineKeyboardButton("🗑 Remove demo video", callback_data="adm:rmdemo")],
+        [InlineKeyboardButton("💾 Backup data", callback_data="adm:backup")],
+    ])
+
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text("🛠 Admin panel", reply_markup=admin_panel_kb())
+
+
+async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ctx.user_data.clear()
+    await update.message.reply_text("Cancelled.", reply_markup=admin_panel_kb())
+
+
+async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
+    await q.answer()
+    kind, _, val = q.data.partition(":")
+    chat = q.message.chat_id
+
+    if kind == "del":
+        DB["plans"].pop(val, None)
+        save_db()
+        await q.edit_message_text("🗑 Plan deleted. Open /admin to continue.")
+    elif val == "add":
+        ctx.user_data.clear()
+        ctx.user_data["step"] = "name"
+        await ctx.bot.send_message(
+            chat, "Step 1/3: Send the plan name.\nExample: Group 1 - Candlestick Basics\n\n/cancel to stop.")
+    elif val == "list":
+        if not DB["plans"]:
+            await ctx.bot.send_message(chat, "No plans yet. Use ➕ Add plan.")
+            return
+        rows = [[InlineKeyboardButton(f"🗑 {p['name']} - ₹{p['price']}", callback_data=f"del:{pid}")]
+                for pid, p in DB["plans"].items()]
+        await ctx.bot.send_message(chat, "Tap a plan to delete it:",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+    elif val == "demo":
+        await ctx.bot.send_message(
+            chat, "🎬 Send me a video now. It will be saved as the demo video and shown to every "
+                  "user at the top when they press /start.\n\nTip: add a caption to the video and "
+                  "it will be shown with it.")
+    elif val == "rmdemo":
+        DB["demo"] = None
+        save_db()
+        await ctx.bot.send_message(chat, "🗑 Demo video removed.")
+    elif val == "backup":
+        save_db()
+        with open(DATA_FILE, "rb") as f:
+            await ctx.bot.send_document(
+                chat, f, filename="data.json",
+                caption="Backup. To restore after a redeploy, just send this file back to the bot.")
+
+
+async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    step = ctx.user_data.get("step")
+    if not step:
+        return
+    t = update.message.text.strip()
+
+    if step == "name":
+        ctx.user_data["new"] = {"name": t[:60]}
+        ctx.user_data["step"] = "price"
+        await update.message.reply_text("Step 2/3: Send the price in INR (numbers only). Example: 49")
+    elif step == "price":
+        try:
+            price = float(t)
+            if price <= 0:
+                raise ValueError
+            price = int(price) if price == int(price) else round(price, 2)
+        except ValueError:
+            await update.message.reply_text("Please send a valid number, for example 49")
+            return
+        ctx.user_data["new"]["price"] = price
+        ctx.user_data["step"] = "link"
+        await update.message.reply_text(
+            "Step 3/3: Send the group invite link (https://t.me/+...) OR the group chat ID (-100...).\n\n"
+            "If you send a chat ID, add this bot as an admin of that group with the 'Invite users' "
+            "permission. The bot will then create a separate single-use link for each buyer.")
+    elif step == "link":
+        if not (t.startswith("http") or t.lstrip("-").isdigit()):
+            await update.message.reply_text("Please send a valid invite link or a numeric chat ID.")
+            return
+        new = ctx.user_data["new"]
+        new["link"] = t
+        pid = str(DB["next_id"])
+        DB["next_id"] += 1
+        DB["plans"][pid] = new
+        save_db()
+        ctx.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Plan added: {new['name']} - ₹{new['price']}\nSend /start to preview.",
+            reply_markup=admin_panel_kb())
+
+
+async def admin_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    v = update.message.video
+    DB["demo"] = {"file_id": v.file_id, "caption": update.message.caption or ""}
+    save_db()
+    await update.message.reply_text(
+        "✅ Demo video saved. It will now appear at the top for every user on /start.\n"
+        "Send /start to preview it.")
+
+
+async def admin_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not (doc.file_name or "").endswith(".json"):
+        return
+    try:
+        raw = await (await doc.get_file()).download_as_bytearray()
+        d = json.loads(bytes(raw))
+        assert isinstance(d.get("plans", {}), dict)
+    except Exception:
+        await update.message.reply_text("❌ That file is not a valid backup.")
+        return
+    DB.clear()
+    DB.update(d)
+    DB.setdefault("demo", None)
+    DB.setdefault("plans", {})
+    DB.setdefault("next_id", 1)
+    save_db()
+    await update.message.reply_text(
+        f"✅ Backup restored: {len(DB['plans'])} plan(s), demo video: {'yes' if DB['demo'] else 'no'}.")
+
+
+# ---------- health server for Render ----------
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -200,18 +380,24 @@ class Health(BaseHTTPRequestHandler):
 
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Health).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Health).serve_forever()
 
 
 def main():
-    # Render Web Service ko open port chahiye; ye health endpoint deta hai
     threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
+    adm = filters.User(user_id=ADMIN_ID)
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(on_plan, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_paid, pattern=r"^paid$"))
     app.add_handler(CallbackQueryHandler(on_back, pattern=r"^back$"))
+    app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^(adm|del):"))
+    app.add_handler(MessageHandler(filters.VIDEO & adm, admin_video))
+    app.add_handler(MessageHandler(filters.Document.ALL & adm, admin_doc))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & adm, admin_text))
     app.run_polling()
 
 

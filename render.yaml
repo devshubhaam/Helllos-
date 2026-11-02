@@ -2,7 +2,7 @@ services:
   - type: web
     name: telegram-course-bot
     runtime: python
-    plan: free            # 24x7 chalane ke liye "starter" + type: worker use karo
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     healthCheckPath: /
@@ -12,4 +12,6 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: FAM_API_KEY
+        sync: false
+      - key: ADMIN_ID
         sync: false
